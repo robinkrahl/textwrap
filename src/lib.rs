@@ -102,11 +102,32 @@ pub use crate::splitting::{HyphenSplitter, NoHyphenation, WordSplitter};
 
 pub mod core;
 
+/// Debug println.
+#[macro_export]
+macro_rules! dprintln {
+    () => {
+        if cfg!(debug_assertions) {
+            println!()
+        }
+    };
+    ($($arg:tt)*) => {
+        if cfg!(debug_assertions) {
+            println!($($arg)*);
+        }
+    };
+}
+
 /// Holds settings for wrapping and filling text.
 #[derive(Debug, Clone)]
 pub struct Options<'a, S: ?Sized = Box<dyn WordSplitter>> {
     /// The width in columns at which the text will be wrapped.
     pub width: usize,
+    /// Wraping algorithm to use: balanced or ragged. The balanced
+    /// algorihm is an optimal fit algorithm which will optimize line
+    /// breaks to avoid overly short lines. The ragged algorithm is
+    /// faster because it uses no look-ahead, but it can produce
+    /// poorer line breaks.
+    pub balanced: bool,
     /// Indentation used for the first line of output.
     pub initial_indent: &'a str,
     /// Indentation used for subsequent lines of output.
@@ -125,6 +146,7 @@ impl<'a, S: ?Sized> From<&'a Options<'a, S>> for Options<'a, &'a S> {
     fn from(options: &'a Options<'a, S>) -> Self {
         Self {
             width: options.width,
+            balanced: options.balanced,
             initial_indent: options.initial_indent,
             subsequent_indent: options.subsequent_indent,
             break_words: options.break_words,
@@ -151,6 +173,7 @@ impl<'a> Options<'a, HyphenSplitter> {
     /// # let expected =
     /// Options {
     ///     width: width,
+    ///     balanced: true,
     ///     initial_indent: "",
     ///     subsequent_indent: "",
     ///     break_words: true,
@@ -158,6 +181,7 @@ impl<'a> Options<'a, HyphenSplitter> {
     /// }
     /// # ;
     /// # assert_eq!(actual.width, expected.width);
+    /// # assert_eq!(actual.balanced, expected.balanced);
     /// # assert_eq!(actual.initial_indent, expected.initial_indent);
     /// # assert_eq!(actual.subsequent_indent, expected.subsequent_indent);
     /// # assert_eq!(actual.break_words, expected.break_words);
@@ -251,6 +275,7 @@ impl<'a, S> Options<'a, S> {
     /// # let expected =
     /// Options {
     ///     width: width,
+    ///     balanced: true,
     ///     initial_indent: "",
     ///     subsequent_indent: "",
     ///     break_words: true,
@@ -258,6 +283,7 @@ impl<'a, S> Options<'a, S> {
     /// }
     /// # ;
     /// # assert_eq!(actual.width, expected.width);
+    /// # assert_eq!(actual.balanced, expected.balanced);
     /// # assert_eq!(actual.initial_indent, expected.initial_indent);
     /// # assert_eq!(actual.subsequent_indent, expected.subsequent_indent);
     /// # assert_eq!(actual.break_words, expected.break_words);
@@ -308,6 +334,7 @@ impl<'a, S> Options<'a, S> {
             initial_indent: "",
             subsequent_indent: "",
             break_words: true,
+            balanced: true,
             splitter: splitter,
         }
     }
@@ -372,6 +399,20 @@ impl<'a, S: WordSplitter> Options<'a, S> {
         }
     }
 
+    /// Change [`self.balanced`]. This controls the algorithm used to
+    /// select break points. If `true`, an optimal-fit algorithm is
+    /// used (see [`core::wrap_fragments_optimal_fit`]) which
+    /// considers all possible line breaks and selects the ones that
+    /// leads to the most. If `false`, a first-fit or greedy algorithm
+    /// with no look-ahead is used (see [`core::wrap_fragments`]).
+    /// Both algorithms run in linear time, the first-fit is about 3.5
+    /// times faster than optimal-fit.
+    ///
+    /// [`self.balanced`]: #structfield.balanced
+    pub fn balanced(self, balanced: bool) -> Self {
+        Options { balanced, ..self }
+    }
+
     /// Change [`self.splitter`]. The [`WordSplitter`] is used to fit
     /// part of a word into the current line when wrapping text.
     ///
@@ -395,6 +436,7 @@ impl<'a, S: WordSplitter> Options<'a, S> {
             initial_indent: self.initial_indent,
             subsequent_indent: self.subsequent_indent,
             break_words: self.break_words,
+            balanced: self.balanced,
             splitter: splitter,
         }
     }
@@ -516,6 +558,54 @@ where
 /// ]);
 /// ```
 ///
+/// # Optimal Fit Wrapped
+///
+/// By default, `wrap` will try to balance the widths of the wrapped
+/// lines to avoid short lines. We call this an “optimal fit” since
+/// the line breaks are computed by considering all possible line
+/// breaks.
+///
+/// As an example, without balancing lines, wrapping the famous Hamlet
+/// quote “To be, or not to be: that is the question” in a narrow
+/// column with room for only 10 characters looks like this:
+///
+/// ```
+/// # use textwrap::{Options, wrap};
+/// #
+/// # let lines = wrap("To be, or not to be: that is the question",
+///                    Options::new(10).balanced(false));
+/// # assert_eq!(lines.join("\n") + "\n", "\
+/// To be, or
+/// not to be:
+/// that is
+/// the
+/// question
+/// # ");
+/// ```
+///
+/// Notice how the second to last line is quite narrow because
+/// “question” was too large to fit? The greedy first-fit algorithm
+/// doesn’t look ahead, so it has no other option than to put
+/// “question” onto its own line.
+///
+/// With a balanced wrapping algorithm, the previous lines are
+/// shortened slightly in order to make the word “is” go into the
+/// second last line:
+///
+/// ```
+/// # use textwrap::{Options, wrap};
+/// #
+/// # let lines = wrap("To be, or not to be: that is the question",
+///                    Options::new(10).balanced(true));
+/// # assert_eq!(lines.join("\n") + "\n", "\
+/// To be,
+/// or not to
+/// be: that
+/// is the
+/// question
+/// # ");
+/// ```
+///
 /// # Examples
 ///
 /// The returned iterator yields lines of type `Cow<'_, str>`. If
@@ -560,6 +650,7 @@ where
 
     let mut lines = Vec::new();
     for line in text.split('\n') {
+        dprintln!("wrapping {:?}", line);
         let words = core::find_words(line);
         let split_words = core::split_words(words, &options);
         let broken_words = if options.break_words {
@@ -577,9 +668,15 @@ where
             split_words.collect::<Vec<_>>()
         };
 
+        dprintln!("broken_words: {} words", broken_words.len());
+
         #[rustfmt::skip]
         let line_lengths = |i| if i == 0 { initial_width } else { subsequent_width };
-        let wrapped_words = core::wrap_fragments(&broken_words, line_lengths);
+        let wrapped_words = if options.balanced {
+            core::wrap_fragments_optimal_fit(&broken_words, line_lengths)
+        } else {
+            core::wrap_fragments(&broken_words, line_lengths)
+        };
 
         let mut idx = 0;
         for words in wrapped_words {
@@ -648,6 +745,7 @@ where
 /// # let width = 80;
 /// Options {
 ///     width: width,
+///     balanced: true,
 ///     initial_indent: "",
 ///     subsequent_indent: "",
 ///     break_words: false,
@@ -737,6 +835,17 @@ mod tests {
     #[test]
     fn wrap_simple() {
         assert_eq!(wrap("foo bar baz", 5), vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn to_be_or_not() {
+        assert_eq!(
+            wrap(
+                "To be, or not to be, that is the question.",
+                Options::new(10).balanced(false)
+            ),
+            vec!["To be, or", "not to be,", "that is", "the", "question."]
+        );
     }
 
     #[test]
@@ -986,13 +1095,13 @@ mod tests {
         let options = Options::new(10);
         assert_eq!(
             wrap("participation is the key to success", &options),
-            vec!["participat", "ion is the", "key to", "success"]
+            vec!["participat", "ion is", "the key to", "success"]
         );
 
         let options = Options::new(10).splitter(dictionary);
         assert_eq!(
             wrap("participation is the key to success", &options),
-            vec!["participa-", "tion is", "the key to", "success"]
+            vec!["partici-", "pation is", "the key to", "success"]
         );
     }
 
@@ -1087,8 +1196,14 @@ mod tests {
         assert_eq!(fill("\n\n\n", 80), "\n\n\n");
         assert_eq!(fill("test\n", 80), "test\n");
         assert_eq!(fill("test\n\na\n\n", 80), "test\n\na\n\n");
-        assert_eq!(fill("1 3 5 7\n1 3 5 7", 7), "1 3 5 7\n1 3 5 7");
-        assert_eq!(fill("1 3 5 7\n1 3 5 7", 5), "1 3 5\n7\n1 3 5\n7");
+        assert_eq!(
+            fill("1 3 5 7\n1 3 5 7", Options::new(7).balanced(false)),
+            "1 3 5 7\n1 3 5 7"
+        );
+        assert_eq!(
+            fill("1 3 5 7\n1 3 5 7", Options::new(5).balanced(false)),
+            "1 3 5\n7\n1 3 5\n7"
+        );
     }
 
     #[test]

@@ -101,6 +101,16 @@ mod unix_only {
         )?;
         left_row += 1;
 
+        write!(
+            stdout,
+            "{}- balanced: {}{:?}{} (toggle with Ctrl-o)",
+            cursor::Goto(left_col, left_row),
+            style::Bold,
+            options.balanced,
+            style::Reset,
+        )?;
+        left_row += 1;
+
         let now = std::time::Instant::now();
         let mut lines = wrap(text, options);
         let elapsed = now.elapsed();
@@ -232,6 +242,7 @@ mod unix_only {
                 Key::Left => options.width = options.width.saturating_sub(1),
                 Key::Right => options.width = options.width.saturating_add(1),
                 Key::Ctrl('b') => options.break_words = !options.break_words,
+                Key::Ctrl('o') => options.balanced = !options.balanced,
                 Key::Ctrl('s') => {
                     let idx = idx_iter.next().unwrap();
                     std::mem::swap(&mut options.splitter, &mut splitters[idx]);

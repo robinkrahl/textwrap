@@ -4,7 +4,8 @@
 //! advanced wrapping functionality when the [`wrap`](super::wrap) and
 //! [`fill`](super::fill) function don't do what you want.
 
-use crate::{Options, WordSplitter};
+use crate::{dprintln, Options, WordSplitter};
+use std::cell::RefCell;
 use unicode_width::UnicodeWidthChar;
 use unicode_width::UnicodeWidthStr;
 
@@ -156,18 +157,21 @@ impl<'a> Word<'a> {
 }
 
 impl Fragment for Word<'_> {
+    #[inline]
     fn width(&self) -> usize {
         self.width
     }
 
     // We assume the whitespace consist of ' ' only. This allows us to
     // compute the display width in constant time.
+    #[inline]
     fn whitespace_width(&self) -> usize {
         self.whitespace.len()
     }
 
     // We assume the penalty is `""` or `"-"`. This allows us to
     // compute the display width in constant time.
+    #[inline]
     fn penalty_width(&self) -> usize {
         self.penalty.len()
     }
@@ -414,6 +418,172 @@ pub fn wrap_fragments<T: Fragment, F: Fn(usize) -> usize>(
         width += fragment.width() + fragment.whitespace_width();
     }
     lines.push(&fragments[start..]);
+    lines
+}
+
+struct LineNumbers {
+    line_numbers: RefCell<Vec<usize>>,
+}
+
+impl LineNumbers {
+    fn new(size: usize) -> Self {
+        let mut line_numbers = Vec::with_capacity(size);
+        line_numbers.push(0);
+        LineNumbers {
+            line_numbers: RefCell::new(line_numbers),
+        }
+    }
+
+    fn get(&self, i: usize, minima: &[(usize, i32)]) -> usize {
+        dprintln!("i: {}, line_numbers: {:?}", i, self.line_numbers.borrow());
+        while self.line_numbers.borrow_mut().len() < i + 1 {
+            let pos = self.line_numbers.borrow().len();
+            let line_number = 1 + self.get(minima[pos].0, &minima);
+            self.line_numbers.borrow_mut().push(line_number);
+        }
+
+        self.line_numbers.borrow()[i]
+    }
+}
+
+/// Per-line penalty. This is added for every line, which makes it
+/// expensive to output more lines than the minimum required.
+const NLINE_PENALTY: i32 = 1000;
+
+/// Per-character cost for lines that overflow the target line width.
+///
+/// With a value of 50², every single character costs as much as
+/// leaving a gap of 50 characters behind. This is becuase we assign
+/// as cost of `gap * gap` to a short line. This means that we can
+/// overflow the line by 1 character in extreme cases:
+///
+/// ```
+/// use textwrap::core::{wrap_fragments_optimal_fit, Word};
+///
+/// let short = "foo ";
+/// let long = "x".repeat(50);
+/// let fragments = vec![Word::from(short), Word::from(&long)];
+///
+/// // Perfect fit, both words are on a single line with no overflow.
+/// let wrapped = wrap_fragments_optimal_fit(&fragments, |_| short.len() + long.len());
+/// assert_eq!(wrapped, vec![&[Word::from(short), Word::from(&long)]]);
+///
+/// // The words no longer fit, yet we get a single line back. While
+/// // the cost of overflow (1 * 2500) is the same as the cost of the
+/// // gap (50 * 50 = 2500), the tie is broken by `NLINE_PENALTY`
+/// // which makes it cheaper to overflow than to use two lines.
+/// let wrapped = wrap_fragments_optimal_fit(&fragments, |_| short.len() + long.len() - 1);
+/// assert_eq!(wrapped, vec![&[Word::from(short), Word::from(&long)]]);
+///
+/// // The cost of overflow would be 2 * 2500, whereas the cost of the
+/// // gap is only 49 * 49 = 2401. We therefore get two lines.
+/// let wrapped = wrap_fragments_optimal_fit(&fragments, |_| short.len() + long.len() - 2);
+/// assert_eq!(wrapped, vec![&[Word::from(short)],
+///                          &[Word::from(&long)]]);
+/// ```
+///
+/// This will only happen if there is a word of width
+const OVERFLOW_PENALTY: i32 = 50 * 50;
+
+/// A line is short if it is less than 1/4 of the target width.
+const SHORT_LINE_FRACTION: usize = 4;
+
+/// Penalize short lines containing just one word.
+const SHORT_ONEWORD_PENALTY: i32 = 25;
+
+/// Penalty for lines ending with a hyphen.
+const HYPHEN_PENALTY: i32 = 25;
+
+/// Wrap fragments into balanced lines.
+pub fn wrap_fragments_optimal_fit<'a, T: Fragment, F: Fn(usize) -> usize>(
+    fragments: &'a [T],
+    line_widths: F,
+) -> Vec<&'a [T]> {
+    let mut widths = Vec::with_capacity(fragments.len() + 1);
+    let mut width = 0;
+    widths.push(width);
+    for fragment in fragments {
+        width += fragment.width() + fragment.whitespace_width();
+        widths.push(width);
+    }
+
+    dprintln!("widths: {:?}", &widths);
+
+    let line_numbers = LineNumbers::new(fragments.len());
+
+    let minima = smawk::online_column_minima(0, widths.len(), |values, i, j| {
+        // Line number for fragment `i`.
+        let line_number = line_numbers.get(i, &values);
+        dprintln!(
+            "word {:2}, line number {:2}, line width: {:2}",
+            i,
+            line_number,
+            line_widths(line_number),
+        );
+
+        let target_width = std::cmp::max(1, line_widths(line_number));
+
+        // Compute the width of a line spanning fragments[i..j] in
+        // constant time. We need to adjust widths[j] by subtracting
+        // the whitespace of fragment[j-i] and then add the penalty.
+        let line_width = widths[j] - widths[i] - fragments[j - 1].whitespace_width()
+            + fragments[j - 1].penalty_width();
+
+        // We compute cost of the line containing fragments[i..j]. We
+        // start with values[i].1, which is the optimal cost for
+        // breaking before fragments[i].
+        //
+        // First, every extra line cost NLINE_PENALTY.
+        let mut cost = values[i].1 + NLINE_PENALTY;
+
+        // Next, we add a penalty depending on the line length.
+        if line_width > target_width {
+            // Lines that overflow get a hefty penalty.
+            let overflow = (line_width - target_width) as i32;
+            cost += overflow * OVERFLOW_PENALTY;
+            dprintln!(
+                "{}..{}: {} column overflow, increased cost by: {}",
+                i,
+                j,
+                overflow,
+                OVERFLOW_PENALTY * overflow
+            );
+        } else if j < fragments.len() {
+            // Other lines (except for the last line) get a milder
+            // penalty which depend on the size of the gap.
+            let gap = (target_width - line_width) as i32;
+            dprintln!("{}..{}: normal, increased cost by: {}", i, j, gap * gap);
+            cost += gap * gap;
+        } else if i + 1 == j && line_width < target_width / SHORT_LINE_FRACTION {
+            // The final line can have any size gap, but we do add a
+            // penalty if the line contain just a single short word.
+            cost += SHORT_ONEWORD_PENALTY;
+        }
+
+        // Finally, we discourage hyphens.
+        if fragments[j - 1].penalty_width() > 0 {
+            cost += HYPHEN_PENALTY;
+        }
+
+        dprintln!("[ {} {} ] cost: {}", i, j, cost);
+
+        cost
+    });
+
+    dprintln!("minima: {:?}", minima);
+
+    let mut lines = Vec::with_capacity(line_numbers.get(fragments.len(), &minima));
+    let mut pos = fragments.len();
+    loop {
+        let prev = minima[pos].0;
+        lines.push(&fragments[prev..pos]);
+        pos = prev;
+        if pos == 0 {
+            break;
+        }
+    }
+
+    lines.reverse();
     lines
 }
 
